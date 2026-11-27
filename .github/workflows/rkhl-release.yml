@@ -150,6 +150,11 @@ jobs:
       # Os mesmos build-args do publish-image.yml do autor. Os labels são escritos
       # aqui, e não pelo metadata-action, porque o `revision` tem de ser o commit
       # da TAG (o GITHUB_SHA de um PR fechado é outro).
+      # A imagem sai primeiro em `X.Y.Z-amd64` e a tag `X.Y.Z` vira um ÍNDICE com
+      # uma entrada linux/amd64, como o juntar-manifestos do autor. Sem o índice,
+      # a tag é um manifesto OCI de imagem única, e o GHCR responde 404 ao
+      # `ghcr_status` do kit, que só aceita índice OCI, manifest list e manifesto
+      # docker v2. É o mesmo pedido do update.sh na VPS (run 46008040971).
       - name: Construir e publicar (linux/amd64)
         id: build
         uses: docker/build-push-action@v7
@@ -159,7 +164,7 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ${{ steps.nome.outputs.ref }}:${{ needs.conferir.outputs.versao }}
+          tags: ${{ steps.nome.outputs.ref }}:${{ needs.conferir.outputs.versao }}-amd64
           labels: |
             org.opencontainers.image.title=${{ matrix.title }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -195,6 +200,26 @@ jobs:
           echo "APP_VERSION=$v revision=$r"
           [ "$v" = "$VERSAO" ] || { echo "::error::APP_VERSION=$v, esperado $VERSAO"; exit 1; }
           [ "$r" = "$SHA" ] || { echo "::error::revision=$r, esperado $SHA"; exit 1; }
+      - name: Publicar X.Y.Z como índice com a entrada linux/amd64
+        env:
+          IMG: ${{ steps.nome.outputs.ref }}
+          VERSAO: ${{ needs.conferir.outputs.versao }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # --prefer-index: com uma fonte só, gera índice em vez de copiar o manifesto.
+          docker buildx imagetools create --prefer-index=true --tag "${IMG}:${VERSAO}" "${IMG}@${DIGEST}"
+          bruto=$(docker buildx imagetools inspect --raw "${IMG}:${VERSAO}")
+          tipo=$(printf '%s' "$bruto" | jq -r '.mediaType')
+          plats=$(printf '%s' "$bruto" | jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture)"' | sort -u | tr '\n' ' ')
+          entrada=$(printf '%s' "$bruto" | jq -r '.manifests[0].digest // empty')
+          echo "${IMG}:${VERSAO} → ${tipo}; plataformas: ${plats}; entrada ${entrada}"
+          case "$tipo" in
+            application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json) ;;
+            *) echo "::error::${IMG}:${VERSAO} não é índice (${tipo})"; exit 1 ;;
+          esac
+          [ "$plats" = "linux/amd64 " ] || { echo "::error::o índice devia ter só linux/amd64 (tem: ${plats})"; exit 1; }
+          [ "$entrada" = "$DIGEST" ] || { echo "::error::a entrada do índice (${entrada}) não é a imagem construída (${DIGEST})"; exit 1; }
 
   publicar:
     needs: [conferir, imagens]
@@ -221,12 +246,31 @@ jobs:
             s=$(ghcr_status "$img" "$VERSAO")
             echo "${IMG_NS}/${img}:${VERSAO} → ${s}"
             if [ "$s" != 200 ]; then
-              echo "::error::${img}:${VERSAO} respondeu ${s} sem login. Pacote novo no GHCR nasce PRIVADO: em github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${img}/settings, troque para Public e rode de novo os jobs que falharam."
+              echo "::error::${img}:${VERSAO} respondeu ${s} sem login. 403: o pacote está PRIVADO (pacote novo no GHCR nasce privado): em github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${img}/settings, troque para Public e rode de novo os jobs que falharam. 404: a tag não existe ou não é índice (o kit não aceita manifesto OCI de imagem única)."
               exit 1
             fi
             manifesto_tem_plataforma "${IMG_NS}/${img}:${VERSAO}" linux/amd64
           done
           trio_publicado "$VERSAO" && echo "trio_publicado ${VERSAO}: ok"
+          # O mesmo pré-voo que o update.sh roda na VPS: 200 sem login e a
+          # plataforma do host (linux/amd64) dentro de cada uma das 4 imagens.
+          preflight_imagens_crm "$VERSAO" linux/amd64 && echo "preflight_imagens_crm ${VERSAO} linux/amd64: ok"
+      - name: Pela tag X.Y.Z (o índice), a imagem diz a versão e o commit certos?
+        env:
+          VERSAO: ${{ needs.conferir.outputs.versao }}
+          SHA: ${{ needs.conferir.outputs.sha }}
+        run: |
+          set -euo pipefail
+          source hostgator-setup-kit/_common.sh
+          for img in deskcommcrm deskcomm-worker deskcomm-scheduler deskcomm-voice-agent; do
+            ref="${IMG_NS}/${img}:${VERSAO}"
+            docker pull -q --platform linux/amd64 "$ref" >/dev/null
+            v=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$ref" | sed -n 's/^APP_VERSION=//p')
+            r=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$ref")
+            echo "${ref}: APP_VERSION=${v} revision=${r}"
+            [ "$v" = "$VERSAO" ] || { echo "::error::${ref}: APP_VERSION=${v}, esperado ${VERSAO}"; exit 1; }
+            [ "$r" = "$SHA" ] || { echo "::error::${ref}: revision=${r}, esperado ${SHA}"; exit 1; }
+          done
       - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -250,12 +294,16 @@ jobs:
             echo ""
             echo "## Imagens (linux/amd64)"
             echo ""
-            echo "| imagem | digest |"
-            echo "| --- | --- |"
+            echo "| imagem | digest da tag (índice) | digest da imagem linux/amd64 |"
+            echo "| --- | --- | --- |"
             for img in deskcommcrm deskcomm-worker deskcomm-scheduler deskcomm-voice-agent; do
-              d=$(docker buildx imagetools inspect "${IMG_NS}/${img}:${VERSAO}" --format '{{json .Manifest}}' | sed -n 's/.*"digest":"\(sha256:[a-f0-9]*\)".*/\1/p' | head -1)
-              [ -n "$d" ] || { echo "::error::sem digest para ${img}:${VERSAO}" >&2; exit 1; }
-              echo "| \`${IMG_NS}/${img}:${VERSAO}\` | \`${d}\` |"
+              bruto=$(docker buildx imagetools inspect --raw "${IMG_NS}/${img}:${VERSAO}")
+              # O digest de um manifesto é o sha256 dos bytes que o registro serve.
+              d=$(docker buildx imagetools inspect "${IMG_NS}/${img}:${VERSAO}" --format '{{.Manifest.Digest}}')
+              e=$(printf '%s' "$bruto" | jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')
+              [[ "$d" =~ ^sha256:[a-f0-9]{64}$ ]] && [[ "$e" =~ ^sha256:[a-f0-9]{64}$ ]] \
+                || { echo "::error::sem digest para ${img}:${VERSAO} (índice='${d}', amd64='${e}')" >&2; exit 1; }
+              echo "| \`${IMG_NS}/${img}:${VERSAO}\` | \`${d}\` | \`${e}\` |"
             done
             echo ""
             echo "## CHANGELOG do autor para ${VERSAO}"
