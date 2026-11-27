@@ -61,6 +61,22 @@ git diff --stat refs/autor/vX.Y.Z origin/rkhl -- . ':!RKHL.md' ':!.github/workfl
 | `rkhl-ci.yml` | Todo PR para `rkhl` | typecheck, lint, testes unitários (7 partes) e build. É o portão do PR de sync. |
 | `rkhl-release.yml` | Merge de um PR `sync/vX.Y.Z`, ou manual com o número (primeira versão) | Confere tudo, constrói e publica as 4 imagens (só **amd64**), confere de fora, sem login, que estão públicas, e só então cria a tag e a release com os **digests**. Também aponta `stable` para a versão. |
 
+**As imagens saem como índice.** Cada imagem é construída só para `linux/amd64` e
+publicada primeiro em `X.Y.Z-amd64`. Depois, a tag `X.Y.Z` vira um **índice** (OCI
+image index) com essa única entrada, como o `juntar-manifestos` do autor faz com
+amd64 + arm64.
+- **Por que o índice:** sem ele, `X.Y.Z` seria um manifesto OCI de imagem única. O
+  `ghcr_status` do kit pede só índice OCI, manifest list e manifesto docker v2, e o
+  GHCR responde **404** para um manifesto OCI simples sem esses tipos. O pré-voo do
+  `update.sh` na VPS faria o mesmo pedido e recusaria a atualização. Foi o que
+  aconteceu no run 46008040971.
+- **O que o job `publicar` confere antes de criar a tag e a release:**
+  - que `X.Y.Z` é índice, só com `linux/amd64`, e aponta para a imagem construída;
+  - `ghcr_status` = 200, `trio_publicado` e `preflight_imagens_crm X.Y.Z linux/amd64`;
+  - `APP_VERSION` e `revision` puxados pela própria tag `X.Y.Z`.
+- **O que a release registra:** o digest do índice e o da imagem amd64.
+- As tags `X.Y.Z-amd64` ficam no GHCR, mas o kit não as usa.
+
 **Juntar um PR de sync: sempre "Create a merge commit".** Squash ou rebase cortam a
 história do autor, e a próxima sincronização daria conflito em tudo. O
 `rkhl-release.yml` recusa publicar um commit que não contém a release do autor com
