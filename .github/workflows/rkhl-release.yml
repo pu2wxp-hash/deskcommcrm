@@ -1,0 +1,281 @@
+# RKHL — publicar a versão do fork (Especificação F1, §3.2 e §3.3).
+#
+# Dispara quando um PR `sync/vX.Y.Z` é JUNTADO em `rkhl`, ou manualmente com o
+# número (é o caminho da PRIMEIRA versão do fork, que não nasce de um PR de sync).
+#
+# A versão do fork tem o MESMO número do autor: `vX.Y.Z` do fork aponta para o
+# commit de `rkhl` que contém a release `vX.Y.Z` do autor. É o único formato que
+# o kit aceita sem mudar nada nele:
+#   - `ultima_release_estavel` lê `/releases/latest` do `origin`;
+#   - `gravar_imagens` grava `${IMG_NS}/<imagem>:X.Y.Z` (sem o "v");
+#   - `trio_publicado`/`preflight_imagens_crm` exigem as 4 imagens públicas (200);
+#   - `_runtime.sh` exige `APP_VERSION=X.Y.Z` na imagem e o label `revision` igual
+#     ao commit da tag para mostrar a versão como verificada no painel.
+#
+# Ordem: confere → constrói e publica as 4 imagens (só amd64) → confere de fora,
+# anonimamente, como a VPS vai ver → só então cria a tag e a release, com os
+# digests. Se algo falhar antes do fim, não existe tag nem release, e o kit
+# continua oferecendo a versão anterior.
+#
+# Tokens: o GITHUB_TOKEN só publica no GHCR (o token fine-grained não tem acesso
+# a pacotes). A tag e a release são criadas com o RKHL_BOT_TOKEN.
+
+name: RKHL — publicar versão do fork
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [rkhl]
+  workflow_dispatch:
+    inputs:
+      versao:
+        description: "Versão vX.Y.Z do autor que o rkhl já contém (primeira versão do fork)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rkhl-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  AUTOR: melgarafael/DeskcommCRM
+  QUARENTENA_DIAS: "7"
+
+jobs:
+  conferir:
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'sync/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.c.outputs.tag }}
+      versao: ${{ steps.c.outputs.versao }}
+      sha: ${{ steps.c.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: rkhl
+          fetch-depth: 0
+      - name: Conferir versão, commit e ancestral do autor
+        id: c
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENTO: ${{ github.event_name }}
+          ENTRADA: ${{ inputs.versao }}
+          RAMO_PR: ${{ github.event.pull_request.head.ref }}
+          SHA_PR: ${{ github.event.pull_request.merge_commit_sha }}
+          TOKEN_BOT: ${{ secrets.RKHL_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$TOKEN_BOT" ] || { echo "::error::Falta o segredo RKHL_BOT_TOKEN"; exit 1; }
+          if [ "$EVENTO" = workflow_dispatch ]; then
+            tag="$ENTRADA"; sha=$(git rev-parse origin/rkhl)
+          else
+            tag="${RAMO_PR#sync/}"; sha="$SHA_PR"
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::versão fora do formato vX.Y.Z: $tag"; exit 1; }
+          git cat-file -e "${sha}^{commit}" || { echo "::error::commit $sha não está no rkhl"; exit 1; }
+          git merge-base --is-ancestor "$sha" origin/rkhl || { echo "::error::$sha não está no rkhl"; exit 1; }
+
+          # A tag do fork é imutável: nunca reaponta uma versão já publicada.
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::a tag ${tag} já existe no fork; versão publicada não muda"; exit 1
+          fi
+
+          # O commit tem de conter a release do autor com o mesmo número (merge
+          # commit, nunca squash/rebase) — é o que dá sentido ao número.
+          git fetch -q --no-tags "https://github.com/${AUTOR}.git" "+refs/tags/${tag}:refs/rkhl-autor/${tag}"
+          autor=$(git rev-parse "refs/rkhl-autor/${tag}^{commit}")
+          git merge-base --is-ancestor "$autor" "$sha" || {
+            echo "::error::o commit ${sha} não contém ${tag} do autor (${autor}). O PR foi juntado com squash ou rebase?"; exit 1; }
+
+          # O commit tem as NOSSAS mudanças: o kit aponta para as imagens deste
+          # repositório. Sem esta trava, juntar por engano um PR "CONFLITO" (que é
+          # o commit puro do autor) publicaria o código do autor como versão do fork.
+          dono=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          git show "${sha}:hostgator-setup-kit/_common.sh" | grep -qxF "IMG_NS=\"ghcr.io/${dono}\"" || {
+            echo "::error::no commit ${sha}, o IMG_NS do kit não aponta para ghcr.io/${dono}: faltam as mudanças do fork (PR de conflito juntado sem resolver?)"; exit 1; }
+
+          # A release do autor é estável e passou a quarentena.
+          rel=$(gh api "repos/${AUTOR}/releases/tags/${tag}" --jq '"\(.draft) \(.prerelease) \(.published_at)"')
+          read -r rascunho pre quando <<< "$rel"
+          [ "$rascunho" = false ] && [ "$pre" = false ] || { echo "::error::${tag} do autor é rascunho ou pré-release"; exit 1; }
+          idade=$(( ( $(date -u +%s) - $(date -u -d "$quando" +%s) ) / 86400 ))
+          [ "$idade" -ge "$QUARENTENA_DIAS" ] || { echo "::error::${tag} do autor tem ${idade} dia(s); a quarentena é ${QUARENTENA_DIAS}"; exit 1; }
+
+          echo "ok: ${tag} do autor (${autor:0:9}, ${idade} dias) está em ${sha:0:9} do rkhl"
+          { echo "tag=$tag"; echo "versao=${tag#v}"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+
+  imagens:
+    needs: [conferir]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: deskcommcrm
+            dockerfile: Dockerfile
+            title: DeskcommCRM
+          - name: deskcomm-worker
+            dockerfile: Dockerfile.worker
+            title: DeskcommCRM worker
+          - name: deskcomm-scheduler
+            dockerfile: Dockerfile.scheduler
+            title: DeskcommCRM scheduler
+          - name: deskcomm-voice-agent
+            dockerfile: Dockerfile.voice-agent
+            title: DeskcommCRM voice agent
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.conferir.outputs.sha }}
+      - name: Nome da imagem
+        id: nome
+        run: echo "ref=${REGISTRY}/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      # Os mesmos build-args do publish-image.yml do autor. Os labels são escritos
+      # aqui, e não pelo metadata-action, porque o `revision` tem de ser o commit
+      # da TAG (o GITHUB_SHA de um PR fechado é outro).
+      - name: Construir e publicar (linux/amd64)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.nome.outputs.ref }}:${{ needs.conferir.outputs.versao }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.conferir.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.conferir.outputs.versao }}
+            org.opencontainers.image.licenses=MIT
+          build-args: |
+            APP_VERSION=${{ needs.conferir.outputs.versao }}
+            NODE_HEAP_MB=6144
+          cache-from: type=gha,scope=rkhl-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=rkhl-${{ matrix.name }}
+      - name: O BUILD_ID do servidor bate com o de .next/static?
+        if: matrix.name == 'deskcommcrm'
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        # A sonda entrou no autor depois da v1.120.0; nas versões que a têm, ela roda.
+        run: |
+          if [ -f scripts/verifica-build-id.sh ]; then
+            bash scripts/verifica-build-id.sh "${{ steps.nome.outputs.ref }}@${{ steps.build.outputs.digest }}"
+          else
+            echo "::notice::esta versão do autor ainda não tem scripts/verifica-build-id.sh"
+          fi
+      - name: A imagem diz a versão e o commit certos?
+        env:
+          REF: ${{ steps.nome.outputs.ref }}@${{ steps.build.outputs.digest }}
+          VERSAO: ${{ needs.conferir.outputs.versao }}
+          SHA: ${{ needs.conferir.outputs.sha }}
+        run: |
+          set -euo pipefail
+          docker pull -q "$REF" >/dev/null
+          v=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$REF" | sed -n 's/^APP_VERSION=//p')
+          r=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$REF")
+          echo "APP_VERSION=$v revision=$r"
+          [ "$v" = "$VERSAO" ] || { echo "::error::APP_VERSION=$v, esperado $VERSAO"; exit 1; }
+          [ "$r" = "$SHA" ] || { echo "::error::revision=$r, esperado $SHA"; exit 1; }
+
+  publicar:
+    needs: [conferir, imagens]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.conferir.outputs.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.RKHL_BOT_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: As 4 imagens estão públicas, como a VPS vai ver? (ghcr_status do kit, anônimo)
+        env:
+          VERSAO: ${{ needs.conferir.outputs.versao }}
+        run: |
+          set -euo pipefail
+          source hostgator-setup-kit/_common.sh
+          source hostgator-setup-kit/_manifestos.sh
+          for img in deskcommcrm deskcomm-worker deskcomm-scheduler deskcomm-voice-agent; do
+            s=$(ghcr_status "$img" "$VERSAO")
+            echo "${IMG_NS}/${img}:${VERSAO} → ${s}"
+            if [ "$s" != 200 ]; then
+              echo "::error::${img}:${VERSAO} respondeu ${s} sem login. Pacote novo no GHCR nasce PRIVADO: em github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${img}/settings, troque para Public e rode de novo os jobs que falharam."
+              exit 1
+            fi
+            manifesto_tem_plataforma "${IMG_NS}/${img}:${VERSAO}" linux/amd64
+          done
+          trio_publicado "$VERSAO" && echo "trio_publicado ${VERSAO}: ok"
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Criar a tag e a release, com os digests
+        env:
+          GH_TOKEN: ${{ secrets.RKHL_BOT_TOKEN }}
+          TAG: ${{ needs.conferir.outputs.tag }}
+          VERSAO: ${{ needs.conferir.outputs.versao }}
+          SHA: ${{ needs.conferir.outputs.sha }}
+          PR: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          source hostgator-setup-kit/_common.sh
+          {
+            echo "Versão **${TAG}** do RKHL CRM: a release ${TAG} do autor ([${AUTOR}](https://github.com/${AUTOR}/releases/tag/${TAG})) com as mudanças do fork. Ramos, versões e atualização: [RKHL.md](https://github.com/${GITHUB_REPOSITORY}/blob/rkhl/RKHL.md)."
+            echo ""
+            echo "- Commit: \`${SHA}\`"
+            [ -z "$PR" ] || echo "- PR de sincronização: ${PR}"
+            echo ""
+            echo "## Imagens (linux/amd64)"
+            echo ""
+            echo "| imagem | digest |"
+            echo "| --- | --- |"
+            for img in deskcommcrm deskcomm-worker deskcomm-scheduler deskcomm-voice-agent; do
+              d=$(docker buildx imagetools inspect "${IMG_NS}/${img}:${VERSAO}" --format '{{json .Manifest}}' | sed -n 's/.*"digest":"\(sha256:[a-f0-9]*\)".*/\1/p' | head -1)
+              [ -n "$d" ] || { echo "::error::sem digest para ${img}:${VERSAO}" >&2; exit 1; }
+              echo "| \`${IMG_NS}/${img}:${VERSAO}\` | \`${d}\` |"
+            done
+            echo ""
+            echo "## CHANGELOG do autor para ${VERSAO}"
+            echo ""
+            awk -v v="$VERSAO" 'index($0, "## [" v "]") == 1 { dentro=1; next } dentro && /^## \[/ { exit } dentro { print }' CHANGELOG.md | head -c 50000
+          } > /tmp/notas.md
+
+          git config user.name "rkhl-bot"
+          git config user.email "rkhl-bot@users.noreply.github.com"
+          git tag -a "$TAG" -m "RKHL CRM ${TAG} (release ${TAG} do autor + fork)" "$SHA"
+          git push -q origin "refs/tags/${TAG}"
+          gh api "repos/${GITHUB_REPOSITORY}/releases" -f tag_name="$TAG" -f name="$TAG" \
+            -F body=@/tmp/notas.md -F draft=false -F prerelease=false -f make_latest=true --jq '.html_url' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Apontar `stable` para esta versão (o default do compose quando o .env não fixa)
+        env:
+          VERSAO: ${{ needs.conferir.outputs.versao }}
+        run: |
+          set -euo pipefail
+          source hostgator-setup-kit/_common.sh
+          for img in deskcommcrm deskcomm-worker deskcomm-scheduler deskcomm-voice-agent; do
+            docker buildx imagetools create --tag "${IMG_NS}/${img}:stable" "${IMG_NS}/${img}:${VERSAO}"
+          done
