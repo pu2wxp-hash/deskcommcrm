@@ -1,0 +1,102 @@
+# RKHL — portão do PR para `rkhl` (Especificação F1, §3.3).
+#
+# As checagens do autor que rodam sem segredo nenhum: typecheck, lint, testes
+# unitários (em 7 partes, como o ci.yml do autor) e o build de produção. Roda em
+# todo PR para `rkhl`, inclusive no `sync/vX.Y.Z` aberto pelo RKHL_BOT_TOKEN.
+#
+# Dois testes do autor tratam `.github/workflows` como um conjunto FECHADO dele
+# (workflows-tem-permissions e gatilho-dos-jobs-de-entrega: todo job e todo
+# escopo de escrita num mapa). Os nossos workflows não estão nesses mapas, e
+# editar os mapas seria mudar teste do autor (fora da §3.3) e dar conflito a cada
+# sincronização. Por isso, antes do `test:unit`, os `rkhl-*.yml` saem da pasta:
+# a suíte inteira roda sem exclusão nenhuma, e esses dois testes continuam
+# vigiando os workflows do autor exatamente como na casa dele. Os nossos são
+# conferidos no job `nossos-workflows`.
+
+name: RKHL — CI
+
+on:
+  pull_request:
+    branches: [rkhl]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rkhl-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unitarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        parte: [1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/preparar-node
+        timeout-minutes: 10
+      - name: Testes unitários (parte ${{ matrix.parte }}/7), sem os rkhl-*.yml na pasta
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rkhl-workflows
+          mv .github/workflows/rkhl-*.yml /tmp/rkhl-workflows/
+          pnpm test:unit --shard=${{ matrix.parte }}/7
+
+  nossos-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Os rkhl-*.yml declaram escopo e não usam executor próprio
+        run: |
+          set -euo pipefail
+          for f in .github/workflows/rkhl-*.yml; do
+            grep -q '^permissions:' "$f" || { echo "::error::$f sem permissions no topo"; exit 1; }
+            if grep -nE '^[[:space:]]*runs-on:.*(EXECUTOR_PROPRIO|RUNNER_PROPRIO|self-hosted|deskcomm-proprio)' "$f"; then
+              echo "::error::$f usa executor próprio (proibido no fork)"; exit 1
+            fi
+          done
+          echo "ok: $(ls .github/workflows/rkhl-*.yml | tr '\n' ' ')"
+
+  tipos-lint-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/preparar-node
+        timeout-minutes: 10
+      - name: Typecheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Build de produção
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+          SENTRY_DSN: "off"
+        run: pnpm build
+
+  rkhl-ci:
+    if: always()
+    needs: [unitarios, nossos-workflows, tipos-lint-build]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Tudo verde?
+        env:
+          U: ${{ needs.unitarios.result }}
+          C: ${{ needs.nossos-workflows.result }}
+          T: ${{ needs.tipos-lint-build.result }}
+        run: |
+          echo "unitarios=$U nossos-workflows=$C tipos-lint-build=$T"
+          [ "$U" = success ] && [ "$C" = success ] && [ "$T" = success ]

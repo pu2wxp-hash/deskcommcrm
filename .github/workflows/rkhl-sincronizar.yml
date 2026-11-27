@@ -1,0 +1,276 @@
+# RKHL — sincronizar o ramo `rkhl` com as releases do autor (Especificação F1, §3.4).
+#
+# Toda segunda às 6h de Brasília (9h UTC), e manual:
+#   1. busca o autor DIRETO (sem passar pela `main` do fork, que não é usada);
+#   2. escolhe a última release estável do autor com pelo menos 7 dias (quarentena);
+#   3. abre o PR `sync/vX.Y.Z` → `rkhl` com o CHANGELOG do intervalo, os arquivos
+#      alterados em caminhos sensíveis e o alerta de SQL destrutivo;
+#   4. com conflito, abre o PR marcado "CONFLITO — PRECISA DO CODE", sem resolver.
+#
+# O PR é aberto com o RKHL_BOT_TOKEN, e não com o GITHUB_TOKEN, por dois motivos:
+#   - o que o GITHUB_TOKEN cria não dispara outros workflows (o rkhl-ci não rodaria);
+#   - o merge traz mudanças do autor em `.github/workflows`, e o GITHUB_TOKEN não
+#     pode empurrar esse diretório.
+# O RKHL_BOT_TOKEN é fine-grained, só deste repositório, com contents, pull-requests
+# e workflows em escrita. Ele só aparece neste workflow e no rkhl-release.yml.
+#
+# Entradas manuais (todas opcionais) existem para os ensaios do critério F1-4,
+# num ramo descartável: `fonte_ref` troca a release escolhida por uma ref
+# qualquer da fonte, e `alvo` troca o ramo `rkhl` por outro.
+
+name: RKHL — sincronizar com o autor
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      fonte:
+        description: "Repositório do autor (dono/nome)"
+        default: "melgarafael/DeskcommCRM"
+        type: string
+      fonte_ref:
+        description: "Ensaio: ref da fonte no lugar da release (ramo ou SHA). Vazio = última release estável com quarentena"
+        default: ""
+        type: string
+      versao:
+        description: "Ensaio: número vX.Y.Z que o PR recebe quando fonte_ref é usado"
+        default: ""
+        type: string
+      alvo:
+        description: "Ramo de destino do PR"
+        default: "rkhl"
+        type: string
+      quarentena_dias:
+        description: "Idade mínima da release do autor, em dias"
+        default: "7"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rkhl-sincronizar
+  cancel-in-progress: false
+
+jobs:
+  sincronizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      FONTE: ${{ inputs.fonte || 'melgarafael/DeskcommCRM' }}
+      FONTE_REF: ${{ inputs.fonte_ref || '' }}
+      VERSAO_ENSAIO: ${{ inputs.versao || '' }}
+      ALVO: ${{ inputs.alvo || 'rkhl' }}
+      QUARENTENA_DIAS: ${{ inputs.quarentena_dias || '7' }}
+    steps:
+      - name: O segredo RKHL_BOT_TOKEN existe?
+        env:
+          TOKEN: ${{ secrets.RKHL_BOT_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Falta o segredo RKHL_BOT_TOKEN (Settings › Secrets and variables › Actions). Sem ele o PR de sync não dispara o rkhl-ci e não pode trazer mudanças em .github/workflows."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.ALVO }}
+          fetch-depth: 0
+          token: ${{ secrets.RKHL_BOT_TOKEN }}
+
+      - name: Escolher a versão do autor
+        id: escolha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FONTE_REF" ]; then
+            # Ensaio: a ref vem pronta e o número vem da entrada `versao`.
+            if ! [[ "$VERSAO_ENSAIO" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::com fonte_ref, a entrada versao precisa ter a forma vX.Y.Z (veio: '$VERSAO_ENSAIO')"
+              exit 1
+            fi
+            tag="$VERSAO_ENSAIO"; ref="$FONTE_REF"
+            echo "ensaio: ${FONTE}@${ref} como ${tag} (sem quarentena)"
+          else
+            limite=$(date -u -d "-${QUARENTENA_DIAS} days" +%s)
+            # Estável = não é rascunho, não é pré-release e a tag é vX.Y.Z sem
+            # sufixo (o kit só aceita esse formato). A maior versão, não a mais
+            # recente por data, para uma correção antiga não passar na frente.
+            tag=$(gh api --paginate "repos/${FONTE}/releases?per_page=100" \
+                  --jq '.[] | select(.draft == false and .prerelease == false) | "\(.tag_name) \(.published_at)"' \
+                | while read -r t quando; do
+                    [[ "$t" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+                    [ "$(date -u -d "$quando" +%s)" -le "$limite" ] || continue
+                    printf '%s\n' "$t"
+                  done | sort -V | tail -1)
+            if [ -z "$tag" ]; then
+              echo "::error::nenhuma release estável do autor com ${QUARENTENA_DIAS} dias ou mais"
+              exit 1
+            fi
+            ref="refs/tags/${tag}"
+            echo "última release estável com ${QUARENTENA_DIAS}+ dias: ${tag}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Buscar o autor e medir o intervalo
+        id: intervalo
+        env:
+          TAG: ${{ steps.escolha.outputs.tag }}
+          REF: ${{ steps.escolha.outputs.ref }}
+          GH_TOKEN: ${{ secrets.RKHL_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Para uma ref local à parte: nenhuma tag do autor entra no repositório.
+          git fetch --no-tags "https://github.com/${FONTE}.git" "+${REF}:refs/rkhl-autor/novo"
+          novo=$(git rev-parse 'refs/rkhl-autor/novo^{commit}')
+          base=$(git merge-base "origin/${ALVO}" "$novo") || {
+            echo "::error::o ${ALVO} e ${TAG} do autor não têm ancestral comum"; exit 1; }
+          if [ "$base" = "$novo" ]; then
+            echo "o ${ALVO} já contém ${TAG} do autor (${novo:0:9}): nada a sincronizar"
+            echo "nada=sim" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A versão de agora sai do CHANGELOG do autor no ponto em que o rkhl o
+          # encontrou por último, sem depender de tag nenhuma.
+          atual=$(git show "${base}:CHANGELOG.md" | sed -n 's/^## \[\([0-9][0-9.]*\)\].*/\1/p' | head -1)
+          echo "versão do autor que o ${ALVO} contém: ${atual:-desconhecida}; base ${base:0:9}"
+          if [ -n "$atual" ] && [ "$(printf '%s\n%s\n' "$atual" "${TAG#v}" | sort -V | tail -1)" = "$atual" ] && [ -z "$FONTE_REF" ]; then
+            echo "o ${ALVO} já está em ${atual}, que não é anterior a ${TAG}: nada a sincronizar"
+            echo "nada=sim" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          ramo="sync/${TAG}"
+          if git ls-remote --exit-code --heads origin "$ramo" >/dev/null 2>&1; then
+            echo "o ramo ${ramo} já existe no fork (PR aberto ou já juntado): nada a fazer"
+            echo "nada=sim" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "nada=nao"
+            echo "novo=$novo"
+            echo "base=$base"
+            echo "atual=$atual"
+            echo "ramo=$ramo"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Juntar e montar o PR
+        if: steps.intervalo.outputs.nada == 'nao'
+        env:
+          TAG: ${{ steps.escolha.outputs.tag }}
+          NOVO: ${{ steps.intervalo.outputs.novo }}
+          BASE: ${{ steps.intervalo.outputs.base }}
+          ATUAL: ${{ steps.intervalo.outputs.atual }}
+          RAMO: ${{ steps.intervalo.outputs.ramo }}
+          GH_TOKEN: ${{ secrets.RKHL_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "rkhl-bot"
+          git config user.email "rkhl-bot@users.noreply.github.com"
+          git checkout -q -b "$RAMO" "origin/${ALVO}"
+
+          conflito=nao
+          if ! git merge --no-ff --no-edit -m "sync: DeskcommCRM ${TAG} do autor" "$NOVO" > /tmp/merge.log 2>&1; then
+            conflito=sim
+            git diff --name-only --diff-filter=U > /tmp/conflitos.txt || true
+            git merge --abort
+            # Sem resolver nada: o ramo vira o próprio commit do autor, e o PR
+            # mostra no GitHub os arquivos em conflito com o rkhl.
+            git checkout -q -B "$RAMO" "$NOVO"
+          fi
+
+          # Caminhos sensíveis (§3.4). Com `:(glob)`, diretório precisa de `**`.
+          git diff --name-status "$BASE" "$NOVO" -- \
+            ':(glob)supabase/migrations/**' ':(glob)hostgator-setup-kit/**' ':(glob)Dockerfile*' \
+            ':(glob)docker-compose*' ':(glob).github/workflows/**' package.json pnpm-lock.yaml > /tmp/sensiveis.txt
+
+          # SQL destrutivo nas migrations NOVAS do intervalo (§3.4). Comentário,
+          # `on delete <ação>` de chave estrangeira e `grant ... delete` não são
+          # comando destrutivo e ficam fora. O que sobra vai em dois grupos: o que
+          # apaga ou renomeia dado (tabela, coluna, schema, TRUNCATE, DELETE FROM,
+          # RENAME) e os demais DROP (política, gatilho, função, restrição, índice:
+          # em geral o "apaga e recria" das migrations idempotentes do autor).
+          : > /tmp/destrutivo-dados.txt; : > /tmp/destrutivo-outros.txt
+          git diff --name-only --diff-filter=A "$BASE" "$NOVO" -- supabase/migrations/ | while read -r f; do
+            git show "${NOVO}:${f}" | grep -nE '' \
+              | grep -viE '^[0-9]+:[[:space:]]*--' \
+              | grep -iE '\b(drop|truncate|delete|rename)\b' \
+              | grep -viE '\bon[[:space:]]+delete\b|^[0-9]+:[[:space:]]*(grant|revoke)\b' \
+              | sed "s|^|${f}:|" > /tmp/achados.txt || true
+            grep -iE '\bdrop[[:space:]]+(table|column|schema)\b|\btruncate\b|\bdelete[[:space:]]+from\b|\brename\b' /tmp/achados.txt >> /tmp/destrutivo-dados.txt || true
+            grep -viE '\bdrop[[:space:]]+(table|column|schema)\b|\btruncate\b|\bdelete[[:space:]]+from\b|\brename\b' /tmp/achados.txt >> /tmp/destrutivo-outros.txt || true
+          done
+          cat /tmp/destrutivo-dados.txt /tmp/destrutivo-outros.txt > /tmp/destrutivo.txt
+          # Workflow NOVO do autor nasce ligado no fork: rodaria no próprio PR.
+          git diff --name-only --diff-filter=A "$BASE" "$NOVO" -- .github/workflows/ > /tmp/workflows-novos.txt || true
+
+          # CHANGELOG do intervalo: as seções do autor acima da versão de agora.
+          # (Em arquivo, e não em pipe: o `exit` do awk mataria o `git show` com
+          # SIGPIPE, e o pipefail derrubaria o passo.)
+          git show "${NOVO}:CHANGELOG.md" > /tmp/changelog-novo.md
+          awk -v atual="$ATUAL" '
+            /^## \[/ { if (index($0, "## [" atual "]") == 1 && atual != "") exit; if ($0 ~ /^## \[Não lançado\]/) next; dentro=1 }
+            dentro { print }' /tmp/changelog-novo.md > /tmp/changelog.md
+
+          {
+            if [ "$conflito" = sim ]; then
+              echo "> [!CAUTION]"
+              echo "> **CONFLITO — PRECISA DO CODE.** O merge de \`${TAG}\` no \`${ALVO}\` deu conflito e não foi resolvido. Este ramo é o commit do autor sem as nossas mudanças: **não junte assim.**"
+              echo ">"
+              echo "> Arquivos em conflito:"
+              sed 's/^/> - `/; s/$/`/' /tmp/conflitos.txt
+              echo ""
+            fi
+            if [ -s /tmp/destrutivo.txt ]; then
+              echo "> [!WARNING]"
+              echo "> **SQL DESTRUTIVO em migration nova** (\`DROP\`, \`TRUNCATE\`, \`DELETE\`, \`ALTER … DROP\` ou \`RENAME\`). Confira cada linha antes de juntar."
+              echo ">"
+              if [ -s /tmp/destrutivo-dados.txt ]; then
+                echo "> **Apaga ou renomeia dado** (tabela, coluna, schema, TRUNCATE, DELETE FROM, RENAME):"
+                head -100 /tmp/destrutivo-dados.txt | sed 's/^/> - `/; s/$/`/'
+              else
+                echo "> Nada apaga ou renomeia tabela, coluna ou linhas."
+              fi
+              echo ""
+              if [ -s /tmp/destrutivo-outros.txt ]; then
+                echo "<details><summary>Outros DROP ($(wc -l < /tmp/destrutivo-outros.txt)): política, gatilho, função, restrição, índice</summary>"
+                echo ""
+                head -200 /tmp/destrutivo-outros.txt | sed 's/^/- `/; s/$/`/'
+                echo ""
+                echo "</details>"
+                echo ""
+              fi
+            fi
+            if [ -s /tmp/workflows-novos.txt ]; then
+              echo "> [!WARNING]"
+              echo "> **Workflow NOVO do autor.** No fork ele nasce ligado. Desligue antes de juntar (\`gh workflow disable <arquivo>\`), se não servir ao fork:"
+              sed 's/^/> - `/; s/$/`/' /tmp/workflows-novos.txt
+              echo ""
+            fi
+            echo "## Sincronização com o autor: ${ATUAL:-?} → ${TAG#v}"
+            echo ""
+            echo "- Fonte: \`${FONTE}\` em \`${NOVO}\`"
+            echo "- Base comum com o \`${ALVO}\`: \`${BASE}\`"
+            echo "- Ao juntar: **Create a merge commit** (nunca squash nem rebase, que cortam a história do autor e fazem a próxima sincronização dar conflito em tudo). O \`rkhl-release.yml\` publica a versão \`${TAG}\` do fork."
+            echo ""
+            echo "## Caminhos sensíveis alterados"
+            echo ""
+            if [ -s /tmp/sensiveis.txt ]; then
+              echo '```'; head -300 /tmp/sensiveis.txt; echo '```'
+              n=$(wc -l < /tmp/sensiveis.txt); [ "$n" -le 300 ] || echo "(mais $((n-300)) arquivos)"
+            else
+              echo "Nenhum."
+            fi
+            echo ""
+            echo "## CHANGELOG do intervalo"
+            echo ""
+            head -c 40000 /tmp/changelog.md
+            [ "$(wc -c < /tmp/changelog.md)" -le 40000 ] || printf '\n\n(CHANGELOG cortado; o completo está no CHANGELOG.md do ramo.)\n'
+          } > /tmp/corpo.md
+
+          git push -q origin "$RAMO"
+          titulo="sync: DeskcommCRM ${TAG} do autor"
+          [ "$conflito" = nao ] || titulo="CONFLITO — PRECISA DO CODE: ${titulo}"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls" -f title="$titulo" -f head="$RAMO" -f base="$ALVO" -F body=@/tmp/corpo.md --jq '.html_url' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
