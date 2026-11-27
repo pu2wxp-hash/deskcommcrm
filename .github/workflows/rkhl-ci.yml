@@ -1,15 +1,17 @@
 # RKHL — portão do PR para `rkhl` (Especificação F1, §3.3).
 #
 # As checagens do autor que rodam sem segredo nenhum: typecheck, lint, testes
-# unitários (em partes, como o ci.yml do autor) e o build de produção. Roda em
+# unitários (em 7 partes, como o ci.yml do autor) e o build de produção. Roda em
 # todo PR para `rkhl`, inclusive no `sync/vX.Y.Z` aberto pelo RKHL_BOT_TOKEN.
 #
-# Os testes que leem `.github/workflows` como um conjunto FECHADO do autor
-# (mapas de jobs, gatilhos, escopos e executores) reprovam qualquer workflow que
-# não esteja nos mapas dele, e os nossos não estão. Editar esses mapas seria
-# mudar teste do autor (fora da §3.3) e dar conflito a cada sincronização. Por
-# isso eles rodam numa parte só deles, com os `rkhl-*.yml` fora da pasta: assim
-# continuam vigiando os workflows do autor exatamente como na casa dele.
+# Dois testes do autor tratam `.github/workflows` como um conjunto FECHADO dele
+# (workflows-tem-permissions e gatilho-dos-jobs-de-entrega: todo job e todo
+# escopo de escrita num mapa). Os nossos workflows não estão nesses mapas, e
+# editar os mapas seria mudar teste do autor (fora da §3.3) e dar conflito a cada
+# sincronização. Por isso, antes do `test:unit`, os `rkhl-*.yml` saem da pasta:
+# a suíte inteira roda sem exclusão nenhuma, e esses dois testes continuam
+# vigiando os workflows do autor exatamente como na casa dele. Os nossos são
+# conferidos no job `nossos-workflows`.
 
 name: RKHL — CI
 
@@ -23,12 +25,6 @@ permissions:
 concurrency:
   group: rkhl-ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
-
-env:
-  # Os testes que tratam .github/workflows como conjunto fechado do autor.
-  CONTRATOS_DE_WORKFLOW: >-
-    tests/unit/workflows-tem-permissions.test.ts
-    tests/unit/gatilho-dos-jobs-de-entrega.test.ts
 
 jobs:
   unitarios:
@@ -44,39 +40,30 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/preparar-node
         timeout-minutes: 10
-      - name: Testes unitários (parte ${{ matrix.parte }}/7)
-        run: |
-          set -euo pipefail
-          exclui=()
-          for f in $CONTRATOS_DE_WORKFLOW; do exclui+=(--exclude "$f"); done
-          pnpm test:unit --shard=${{ matrix.parte }}/7 "${exclui[@]}"
-
-  contratos-de-workflow:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/preparar-node
-        timeout-minutes: 10
-      - name: Os contratos do autor, sobre os workflows do autor
+      - name: Testes unitários (parte ${{ matrix.parte }}/7), sem os rkhl-*.yml na pasta
         run: |
           set -euo pipefail
           mkdir -p /tmp/rkhl-workflows
           mv .github/workflows/rkhl-*.yml /tmp/rkhl-workflows/
-          # shellcheck disable=SC2086
-          pnpm vitest run $CONTRATOS_DE_WORKFLOW
-      - name: Os nossos workflows têm escopo declarado em todo job
+          pnpm test:unit --shard=${{ matrix.parte }}/7
+
+  nossos-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Os rkhl-*.yml declaram escopo e não usam executor próprio
         run: |
           set -euo pipefail
-          for f in /tmp/rkhl-workflows/rkhl-*.yml; do
+          for f in .github/workflows/rkhl-*.yml; do
             grep -q '^permissions:' "$f" || { echo "::error::$f sem permissions no topo"; exit 1; }
-            if grep -nE 'runs-on:.*(EXECUTOR_PROPRIO|RUNNER_PROPRIO|self-hosted|deskcomm-proprio)' "$f"; then
+            if grep -nE '^[[:space:]]*runs-on:.*(EXECUTOR_PROPRIO|RUNNER_PROPRIO|self-hosted|deskcomm-proprio)' "$f"; then
               echo "::error::$f usa executor próprio (proibido no fork)"; exit 1
             fi
           done
-          echo "ok: $(ls /tmp/rkhl-workflows | tr '\n' ' ')"
+          echo "ok: $(ls .github/workflows/rkhl-*.yml | tr '\n' ' ')"
 
   tipos-lint-build:
     runs-on: ubuntu-latest
@@ -101,15 +88,15 @@ jobs:
 
   rkhl-ci:
     if: always()
-    needs: [unitarios, contratos-de-workflow, tipos-lint-build]
+    needs: [unitarios, nossos-workflows, tipos-lint-build]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Tudo verde?
         env:
           U: ${{ needs.unitarios.result }}
-          C: ${{ needs.contratos-de-workflow.result }}
+          C: ${{ needs.nossos-workflows.result }}
           T: ${{ needs.tipos-lint-build.result }}
         run: |
-          echo "unitarios=$U contratos-de-workflow=$C tipos-lint-build=$T"
+          echo "unitarios=$U nossos-workflows=$C tipos-lint-build=$T"
           [ "$U" = success ] && [ "$C" = success ] && [ "$T" = success ]
