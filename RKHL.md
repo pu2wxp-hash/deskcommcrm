@@ -77,8 +77,8 @@ autor, só servem à `main` dele ou publicariam código sem revisão. Um workflo
   - `workflows-tem-permissions` (escopos de escrita só com justificativa);
   - `gatilho-dos-jobs-de-entrega` (todo job num mapa).
 - Os `rkhl-*.yml` não estão nesses mapas. Editar os mapas seria mudar teste do autor e dar conflito a cada sincronização.
-- Por isso o `rkhl-ci` roda esses dois numa parte própria, com os `rkhl-*.yml` fora da pasta. Assim eles seguem vigiando os workflows do autor como na casa dele.
-- Localmente, o `pnpm test:unit` completo reprova esses dois enquanto os `rkhl-*.yml` estiverem na pasta.
+- Por isso o `rkhl-ci` tira os `rkhl-*.yml` da pasta antes do `test:unit`: a suíte roda inteira, e esses dois testes seguem vigiando os workflows do autor como na casa dele.
+- Para rodar igual na sua máquina: `mkdir -p /tmp/rkhl && mv .github/workflows/rkhl-*.yml /tmp/rkhl/ && pnpm test:unit; mv /tmp/rkhl/rkhl-*.yml .github/workflows/`.
 
 ### O segredo `RKHL_BOT_TOKEN`
 
